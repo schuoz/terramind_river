@@ -632,8 +632,9 @@ def main():
         avg_t_mse = t_mse / n_t
         avg_t_rmse = math.sqrt(max(avg_t_mse, 0.0))
 
-        model.train()
+        model.eval()
         v_loss = v_gnll = v_mae = v_mse = 0.0
+        v_aleatoric = v_epistemic = v_total = 0.0
         with torch.no_grad():
             for imgs, geos, targets, target_stds in val_loader:
                 imgs = imgs.to(device)
@@ -642,15 +643,29 @@ def main():
                 target_stds = target_stds.to(device)
                 std_input = target_stds if args.use_std_as_input else None
                 with torch.cuda.amp.autocast(enabled=amp_enabled):
-                    preds = torch.stack([model(imgs, geos, std_input)[0] for _ in range(args.mc_samples)])
-                    m = preds.mean(0)
-                    _, lv = model(imgs, geos, std_input)
+                    outputs = [model(imgs, geos, std_input) for _ in range(args.mc_samples)]
+                    preds_m = torch.stack([o[0] for o in outputs])
+                    preds_lv = torch.stack([o[1] for o in outputs])
+                    
+                    m = preds_m.mean(0)
+                    if args.mc_samples > 1:
+                        epistemic_var = preds_m.var(0)
+                    else:
+                        epistemic_var = torch.zeros_like(m)
+                        
+                    aleatoric_var = torch.exp(preds_lv).mean(0)
+                    total_var = aleatoric_var + epistemic_var
+                    lv = torch.log(total_var)
+                    
                     lv_det = train_step_loss(args, m, lv, targets, target_stds).item()
                 v_loss += lv_det
                 v_gnll += gnll_loss(m, lv, targets).item()
                 err = m - targets
                 v_mae += err.abs().mean().item()
                 v_mse += err.pow(2).mean().item()
+                v_aleatoric += aleatoric_var.mean().item()
+                v_epistemic += epistemic_var.mean().item()
+                v_total += total_var.mean().item()
 
         n_v = len(val_loader)
         avg_v_loss = v_loss / n_v
@@ -658,6 +673,9 @@ def main():
         avg_v_mae = v_mae / n_v
         avg_v_mse = v_mse / n_v
         avg_v_rmse = math.sqrt(max(avg_v_mse, 0.0))
+        avg_v_aleatoric = v_aleatoric / n_v
+        avg_v_epistemic = v_epistemic / n_v
+        avg_v_total = v_total / n_v
 
         train_m = metric_bundle(avg_t_loss, avg_t_gnll, avg_t_mae, avg_t_mse, avg_t_rmse)
         val_m = metric_bundle(avg_v_loss, avg_v_gnll, avg_v_mae, avg_v_mse, avg_v_rmse)
@@ -667,7 +685,8 @@ def main():
             f"Train loss({args.loss}): {avg_t_loss:.4f} | Val loss: {avg_v_loss:.4f} | "
             f"Train MSE: {avg_t_mse:.4f} MAE: {avg_t_mae:.4f} RMSE: {avg_t_rmse:.4f} | "
             f"Val MSE: {avg_v_mse:.4f} MAE: {avg_v_mae:.4f} RMSE: {avg_v_rmse:.4f} | "
-            f"Train GNLL(diag): {avg_t_gnll:.4f} Val GNLL(diag): {avg_v_gnll:.4f}"
+            f"Train GNLL: {avg_t_gnll:.4f} Val GNLL: {avg_v_gnll:.4f} | "
+            f"Val Var (Aleatoric: {avg_v_aleatoric:.4f}, Epistemic: {avg_v_epistemic:.4f}, Total: {avg_v_total:.4f})"
         )
 
         writer.add_scalar("Loss/train", avg_t_loss, epoch)
@@ -676,6 +695,9 @@ def main():
         writer.add_scalar("OptimizedLoss/val", avg_v_loss, epoch)
         writer.add_scalar("GNLL/train", avg_t_gnll, epoch)
         writer.add_scalar("GNLL/val", avg_v_gnll, epoch)
+        writer.add_scalar("Variance/val_aleatoric", avg_v_aleatoric, epoch)
+        writer.add_scalar("Variance/val_epistemic", avg_v_epistemic, epoch)
+        writer.add_scalar("Variance/val_total", avg_v_total, epoch)
         writer.add_scalar("MAE/train", avg_t_mae, epoch)
         writer.add_scalar("MAE/val", avg_v_mae, epoch)
         writer.add_scalar("MSE/train", avg_t_mse, epoch)
