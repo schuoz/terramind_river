@@ -1,0 +1,11 @@
+# PyTorch with CUDA: installed first by run_training.sh from the cu124 wheel index.
+# CPU-only: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+numpy
+pandas
+h5py
+rasterio
+tqdm
+timm
+albumentations
+tensorboard
