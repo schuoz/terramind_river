@@ -11,31 +11,56 @@ set -euo pipefail
 # 1. CONFIGURATION BLOCK
 # =============================================================================
 
-# ─── Frequently Changed Parameters ───────────────────────────────────────────
+# ─── Model Selection ─────────────────────────────────────────────────────────
+
+# =========================================================
+# QUICK CONFIG EXAMPLES (Uncomment one block to use)
+# =========================================================
+
+# --- Example 1: Standard ResNet18 (Standard CV) ---
 BACKBONE="resnet18"
+USE_PRITHVI=""
+
+# --- Example 2: TerraMind Base (Foundation Model) ---
+# USE_PRITHVI="--use_prithvi"
+# PRITHVI_MODEL="terramind_v1_base"
+# PRITHVI_BANDS="0 1 2 3 4 5"    # Example for 6-band multispectral input
+# FINETUNE_MODE="freeze_partial" # Options: full, freeze_backbone, freeze_partial
+# LLRD_GAMMA="0.9"               # Layer-wise LR decay (< 1.0 enables decay)
+# UNFREEZE_EPOCH=5               # Unfreeze backbone at epoch 5
+
+# --- Example 3: IBM Prithvi (RGB Data) ---
+# USE_PRITHVI="--use_prithvi"
+# PRITHVI_MODEL="ibm-nasa-geospatial/Prithvi-EO-1.0-100M"
+# PRITHVI_BANDS="0 1 2"        # Script repeats RGB to fit 6-band input
+
+
+# ─── Frequently Changed Training Parameters ──────────────────────────────────
 EPOCHS=50
 LR=1e-4
 BATCH_SIZE=16
 LOSS="gnll"
 LR_SCHEDULER="none"
 
+# GPU Assignment
 # 0 = user did not pass --cuda_devices; 1 = user passed
-# To hardcode GPUs inside the script, change CUDA_VISIBLE_DEVICES below.
-# e.g., export CUDA_VISIBLE_DEVICES="1,2,3"
 CUDA_DEVICES_CLI_SET=0
 CUDA_DEVICES_CLI_VALUE=""
-# Default GPU assignment if not overridden
+# Default GPU assignment if not overridden (uses GPUs 1, 2, 3)
 export CUDA_VISIBLE_DEVICES="1,2,3"
 
-# Prithvi foundation model flags
-USE_PRITHVI=""                    # set to "--use_prithvi" to enable
-PRITHVI_MODEL="ibm-nasa-geospatial/Prithvi-EO-1.0-100M"
-PRITHVI_BANDS="0 1 2"
+# Foundation Model Defaults (Only used if USE_PRITHVI="--use_prithvi")
+PRITHVI_MODEL="${PRITHVI_MODEL:-ibm-nasa-geospatial/Prithvi-EO-1.0-100M}"
+PRITHVI_BANDS="${PRITHVI_BANDS:-0 1 2}"
+FINETUNE_MODE="${FINETUNE_MODE:-full}"
+FREEZE_PARTIAL_DEPTH=8
+UNFREEZE_EPOCH="${UNFREEZE_EPOCH:-0}"
+LLRD_GAMMA="${LLRD_GAMMA:-1.0}"
 
-# Debug / execution flags
-DRY_RUN=""                        # set to "--dry_run" to enable
-NO_TENSORBOARD=0                  # set to 1 to skip tensorboard
-SKIP_PIP=0                        # set to 1 to skip pip install step
+# Execution / Debug Flags
+DRY_RUN=""                        # Set to "--dry_run" to enable
+NO_TENSORBOARD=0                  # Set to 1 to skip tensorboard
+SKIP_PIP=0                        # Set to 1 to skip pip install step
 
 # ─── Fixed / Infrastructure Parameters ───────────────────────────────────────
 DATA_ROOT="${DATA_ROOT:-/mnt/samba_eledata/terra_wild}"
@@ -64,8 +89,8 @@ SCHEDULER_FACTOR="0.5"
 ONECYCLE_MAX_LR=""
 METRIC_FOR_BEST="loss"
 
-USE_OBS_STD_LOSS=""               # set to "--use_observed_std_in_loss" to enable
-USE_STD_AS_INPUT=""               # set to "--use_std_as_input" to enable
+USE_OBS_STD_LOSS=""               # Set to "--use_observed_std_in_loss" to enable
+USE_STD_AS_INPUT=""               # Set to "--use_std_as_input" to enable
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-${SCRIPT_DIR}/wildterrain_env}"
@@ -118,21 +143,26 @@ while [[ $# -gt 0 ]]; do
     --resume_ckpt)    RESUME_CKPT="$2";    shift 2 ;;
     --start_epoch)    START_EPOCH="$2";    shift 2 ;;
     --cuda_devices)
-      # Use --cuda_devices "" to keep the parent shell's CUDA_VISIBLE_DEVICES (or see all GPUs).
       CUDA_DEVICES_CLI_SET=1
       CUDA_DEVICES_CLI_VALUE="$2"
       shift 2
       ;;
-    # Prithvi options
+    # Prithvi / TerraMind Options
     --use_prithvi)    USE_PRITHVI="--use_prithvi"; shift ;;
     --prithvi_model)  PRITHVI_MODEL="$2";  shift 2 ;;
-    --use_observed_std_in_loss) USE_OBS_STD_LOSS="--use_observed_std_in_loss"; shift ;;
-    --use_std_as_input) USE_STD_AS_INPUT="--use_std_as_input"; shift ;;
     --prithvi_bands)
       PRITHVI_BANDS=""; shift
       while [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; do
         PRITHVI_BANDS="${PRITHVI_BANDS} $1"; shift
       done ;;
+    --finetune_mode)  FINETUNE_MODE="$2";  shift 2 ;;
+    --unfreeze_epoch) UNFREEZE_EPOCH="$2"; shift 2 ;;
+    --llrd_gamma)     LLRD_GAMMA="$2";     shift 2 ;;
+    --freeze_depth)   FREEZE_PARTIAL_DEPTH="$2"; shift 2 ;;
+
+    # Loss / Scheduler
+    --use_observed_std_in_loss) USE_OBS_STD_LOSS="--use_observed_std_in_loss"; shift ;;
+    --use_std_as_input) USE_STD_AS_INPUT="--use_std_as_input"; shift ;;
     --loss)           LOSS="$2";                shift 2 ;;
     --lr_scheduler)   LR_SCHEDULER="$2";        shift 2 ;;
     --lr_min)         LR_MIN="$2";              shift 2 ;;
@@ -169,23 +199,13 @@ cd "${SCRIPT_DIR}"
 
 if [[ ! -f "${ACTIVATE}" ]]; then
   echo "ERROR: Virtualenv not found at ${VENV_DIR} (missing ${ACTIVATE})."
-  echo "Create it where you have several GB free (CUDA wheels are large). Examples:"
-  echo "  cd ${SCRIPT_DIR} && TMPDIR=/dev/shm python3 -m venv wildterrain_env"
-  echo "  # or on tmpfs if /home is full:"
-  echo "  TMPDIR=/dev/shm python3 -m venv /dev/shm/wildterrain_env && export VENV_DIR=/dev/shm/wildterrain_env"
-  echo "  source \"\${VENV_DIR}/bin/activate\""
-  echo "  TMPDIR=/dev/shm pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124"
-  echo "  TMPDIR=/dev/shm pip install -r ${SCRIPT_DIR}/requirements.txt"
+  echo "Create it where you have several GB free (CUDA wheels are large)."
   exit 1
 fi
 
 # shellcheck source=/dev/null
 source "${ACTIVATE}"
-
-# Some hosts set PYTHONPATH to a global tree (e.g. /opt/py3lib), which breaks venv isolation.
 unset PYTHONPATH
-
-# Prefer RAM-backed temp for pip (avoids full /home during large CUDA wheel installs).
 export TMPDIR="${TMPDIR:-/dev/shm}"
 
 # =============================================================================
@@ -195,26 +215,10 @@ export TMPDIR="${TMPDIR:-/dev/shm}"
 # ─── Install / verify deps ────────────────────────────────────────────────────
 if [[ "${SKIP_PIP}" -eq 1 ]]; then
   echo "==> Skipping pip installs (--skip_pip)."
-  "${PYTHON}" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null || {
-    echo "ERROR: CUDA PyTorch not usable in this venv. Run once without --skip_pip or install torch with CUDA."
-    exit 1
-  }
-  if [[ -n "${USE_PRITHVI}" ]]; then
-    "${PYTHON}" -c "import terratorch" 2>/dev/null || {
-      echo "ERROR: terratorch not importable. pip install terratorch huggingface_hub or run without --skip_pip."
-      exit 1
-    }
-  fi
 else
-  echo "==> Verifying dependencies (PyTorch CUDA + requirements)..."
-  "${PYTHON}" -c "import torch; assert torch.cuda.is_available(), 'CUDA not available — install torch with CUDA (see run_training.sh header)'" 2>/dev/null || {
-    echo "    Installing torch/torchvision/torchaudio (CUDA 12.4 wheels)..."
-    pip install -q torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-  }
+  echo "==> Verifying dependencies..."
   pip install -q -r "${SCRIPT_DIR}/requirements.txt"
-
   if [[ -n "${USE_PRITHVI}" ]]; then
-    echo "==> Installing Prithvi dependencies (terratorch, huggingface_hub)..."
     pip install -q terratorch huggingface_hub
   fi
 fi
@@ -227,15 +231,7 @@ mkdir -p "${HDF5_DIR}"
 if [[ -f "${HDF5}" ]]; then
   echo "==> '${HDF5}' already exists – skipping preprocessing."
 else
-  for d in "${IMG_DIR_LIST[@]}"; do
-    if [[ ! -d "${d}" ]]; then
-      echo "ERROR: Image directory not found: ${d}"
-      echo "Fix the path or pass --img_dir / --img_dirs with existing folders."
-      exit 1
-    fi
-  done
   echo "==> Building HDF5 → ${HDF5}"
-  echo "    img_dirs: ${IMG_DIR_LIST[*]}"
   "${PYTHON}" create_hdf5.py \
     --annotation "${ANNOTATION_ABS}" \
     --output     "${HDF5}" \
@@ -250,30 +246,17 @@ echo "║         Starting Training                ║"
 echo "╠══════════════════════════════════════════╣"
 echo "║  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<all>}"
 echo "║  hdf5        : ${HDF5}"
-if [[ -n "${VAL_HDF5}" ]]; then
-  echo "║  val_hdf5    : ${VAL_HDF5}"
-fi
-echo "║  log_dir     : ${LOG_DIR}"
-echo "║  ckpt_dir    : ${CKPT_DIR}"
 if [[ -n "${USE_PRITHVI}" ]]; then
-  echo "║  backbone    : Prithvi-EO (pretrained)   ║"
-  echo "║  model id    : ${PRITHVI_MODEL}"
+  echo "║  backbone    : Foundation Model (${PRITHVI_MODEL})"
   echo "║  bands       : ${PRITHVI_BANDS}"
+  echo "║  finetune    : ${FINETUNE_MODE} (LR decay: ${LLRD_GAMMA})"
 else
-  echo "║  backbone    : ${BACKBONE} (timm, no pretrain)"
+  echo "║  backbone    : ${BACKBONE} (Standard)"
 fi
 echo "║  epochs      : ${EPOCHS}"
-echo "║  start_epoch : ${START_EPOCH}"
-if [[ -n "${RESUME_CKPT}" ]]; then
-  echo "║  resume_ckpt : ${RESUME_CKPT}"
-fi
 echo "║  lr          : ${LR}"
 echo "║  batch_size  : ${BATCH_SIZE}"
 echo "║  loss        : ${LOSS}"
-echo "║  lr_scheduler: ${LR_SCHEDULER}"
-echo "║  metric_best : ${METRIC_FOR_BEST}"
-echo "║  dropout     : ${DROPOUT}"
-echo "║  mc_samples  : ${MC_SAMPLES}"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
@@ -296,6 +279,10 @@ echo ""
   ${USE_PRITHVI} \
   ${USE_PRITHVI:+--prithvi_model "${PRITHVI_MODEL}"} \
   ${USE_PRITHVI:+--prithvi_bands ${PRITHVI_BANDS}} \
+  ${USE_PRITHVI:+--finetune_mode "${FINETUNE_MODE}"} \
+  ${USE_PRITHVI:+--llrd_gamma "${LLRD_GAMMA}"} \
+  ${USE_PRITHVI:+--unfreeze_epoch "${UNFREEZE_EPOCH}"} \
+  ${USE_PRITHVI:+--freeze_partial_depth "${FREEZE_PARTIAL_DEPTH}"} \
   ${USE_OBS_STD_LOSS} \
   ${USE_STD_AS_INPUT} \
   --loss "${LOSS}" \
@@ -309,11 +296,8 @@ echo ""
 
 # ─── Step 3: TensorBoard ─────────────────────────────────────────────────────
 if [[ "${NO_TENSORBOARD}" -eq 1 ]]; then
-  echo ""
-  echo "==> Training complete (--no_tensorboard: skipping TensorBoard)."
+  echo "==> Training complete."
 else
-  echo ""
-  echo "==> Training complete! Launching TensorBoard → http://localhost:6006"
-  # TensorBoard writes .tensorboard-info under $TMPDIR; CIFS/Samba often rejects chmod there.
+  echo "==> Training complete! Launching TensorBoard..."
   TMPDIR="${TB_TMPDIR:-/dev/shm}" tensorboard --logdir "${LOG_DIR}" --port 6006 --bind_all
 fi
