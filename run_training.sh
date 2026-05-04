@@ -4,33 +4,75 @@
 #
 # Usage:
 #   bash run_training.sh [options]
-#
-# Data / GPUs (defaults for this project layout):
-#   DATA_ROOT=/mnt/samba_eledata/terra_wild  → dataset.h5, runs/, checkpoints/
-#   CUDA_VISIBLE_DEVICES=1,2,3               → use physical GPUs 1–3 (override with --cuda_devices)
-#
-# Image dirs (defaults below; override with --img_dir / --img_dirs). Required only when HDF5 is missing.
-#   bash run_training.sh --no_tensorboard \
-#     --img_dir /path/to/train_tifs --img_dir /path/to/val_tifs
-#
-# -- Standard (timm backbone) ------------------------------------------------
-#   bash run_training.sh --no_tensorboard
-#
-# -- Prithvi-EO pretrained geospatial ViT ------------------------------------
-#   bash run_training.sh --use_prithvi --no_tensorboard
-#
-# -- Dry run (shape check) ---------------------------------------------------
-#   bash run_training.sh --no_tensorboard --dry_run
-#
-# -- Parallel runs (prime venv once, then skip pip) ----------------------------
-#   bash run_training.sh --no_tensorboard --skip_pip --cuda_devices 0,1 ...
 # =============================================================================
 set -euo pipefail
 
+# =============================================================================
+# 1. CONFIGURATION BLOCK
+# =============================================================================
+
+# ─── Frequently Changed Parameters ───────────────────────────────────────────
+BACKBONE="resnet18"
+EPOCHS=50
+LR=1e-4
+BATCH_SIZE=16
+LOSS="gnll"
+LR_SCHEDULER="none"
+
+# 0 = user did not pass --cuda_devices; 1 = user passed
+# To hardcode GPUs inside the script, change CUDA_VISIBLE_DEVICES below.
+# e.g., export CUDA_VISIBLE_DEVICES="1,2,3"
+CUDA_DEVICES_CLI_SET=0
+CUDA_DEVICES_CLI_VALUE=""
+# Default GPU assignment if not overridden
+export CUDA_VISIBLE_DEVICES="1,2,3"
+
+# Prithvi foundation model flags
+USE_PRITHVI=""                    # set to "--use_prithvi" to enable
+PRITHVI_MODEL="ibm-nasa-geospatial/Prithvi-EO-1.0-100M"
+PRITHVI_BANDS="0 1 2"
+
+# Debug / execution flags
+DRY_RUN=""                        # set to "--dry_run" to enable
+NO_TENSORBOARD=0                  # set to 1 to skip tensorboard
+SKIP_PIP=0                        # set to 1 to skip pip install step
+
+# ─── Fixed / Infrastructure Parameters ───────────────────────────────────────
+DATA_ROOT="${DATA_ROOT:-/mnt/samba_eledata/terra_wild}"
+ANNOTATION="data/Annotation.csv"
+DEFAULT_TRAIN_TIF_ROOT="/home/szong/df/work/s2_50000/data/resample_real_time_sr_nocloud_train_v2"
+DEFAULT_VAL_TIF_ROOT="/home/szong/df/work/s2_50000/data/resample_real_time_sr_nocloud_val_v2"
+declare -a IMG_DIR_LIST=()
+
+HDF5=""
+VAL_HDF5=""
+LOG_DIR=""
+CKPT_DIR=""
+
+IMG_SIZE=224
+VAL_SPLIT=0.15
+DROPOUT=0.3
+MC_SAMPLES=20
+NUM_WORKERS=4
+SEED=42
+RESUME_CKPT=""
+START_EPOCH=1
+
+LR_MIN="1e-6"
+SCHEDULER_PATIENCE=5
+SCHEDULER_FACTOR="0.5"
+ONECYCLE_MAX_LR=""
+METRIC_FOR_BEST="loss"
+
+USE_OBS_STD_LOSS=""               # set to "--use_observed_std_in_loss" to enable
+USE_STD_AS_INPUT=""               # set to "--use_std_as_input" to enable
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Default venv next to the repo; override if /home is full, e.g.:
-#   export VENV_DIR=/dev/shm/wildterrain_env
 VENV_DIR="${VENV_DIR:-${SCRIPT_DIR}/wildterrain_env}"
+
+# =============================================================================
+# 2. VIRTUAL ENVIRONMENT SETUP
+# =============================================================================
 
 # Detect OS for venv activation path
 if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "cygwin"* ]] || \
@@ -42,56 +84,9 @@ else
   ACTIVATE="${VENV_DIR}/bin/activate"
 fi
 
-# ─── Defaults ─────────────────────────────────────────────────────────────────
-DATA_ROOT="${DATA_ROOT:-/mnt/samba_eledata/terra_wild}"
-ANNOTATION="data/Annotation.csv"
-declare -a IMG_DIR_LIST=()
-
-# Default TIF roots (used when no --img_dir / --img_dirs are passed).
-DEFAULT_TRAIN_TIF_ROOT="/home/szong/df/work/s2_50000/data/resample_real_time_sr_nocloud_train_v2"
-DEFAULT_VAL_TIF_ROOT="/home/szong/df/work/s2_50000/data/resample_real_time_sr_nocloud_val_v2"
-
-HDF5=""
-VAL_HDF5=""
-LOG_DIR=""
-CKPT_DIR=""
-
-IMG_SIZE=224
-BACKBONE="resnet18"
-EPOCHS=50
-LR=1e-4
-BATCH_SIZE=16
-VAL_SPLIT=0.15
-DROPOUT=0.3
-MC_SAMPLES=20
-NUM_WORKERS=4
-SEED=42
-DRY_RUN=""
-RESUME_CKPT=""
-START_EPOCH=1
-
-NO_TENSORBOARD=0
-SKIP_PIP=0
-# 0 = user did not pass --cuda_devices; 1 = user passed (value may be empty = do not override)
-CUDA_DEVICES_CLI_SET=0
-CUDA_DEVICES_CLI_VALUE=""
-
-# Prithvi flags
-USE_PRITHVI=""
-PRITHVI_MODEL="ibm-nasa-geospatial/Prithvi-EO-1.0-100M"
-PRITHVI_BANDS="0 1 2"
-USE_OBS_STD_LOSS=""
-USE_STD_AS_INPUT=""
-
-LOSS="gnll"
-LR_SCHEDULER="none"
-LR_MIN="1e-6"
-SCHEDULER_PATIENCE=5
-SCHEDULER_FACTOR="0.5"
-ONECYCLE_MAX_LR=""
-METRIC_FOR_BEST="loss"
-
-# ─── Parse args ───────────────────────────────────────────────────────────────
+# =============================================================================
+# 3. ARGUMENT PARSING (Overrides Configuration Block)
+# =============================================================================
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --data_root)      DATA_ROOT="$2";      shift 2 ;;
@@ -168,10 +163,6 @@ if [[ "${CUDA_DEVICES_CLI_SET}" -eq 1 ]]; then
   if [[ -n "${CUDA_DEVICES_CLI_VALUE}" ]]; then
     export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES_CLI_VALUE}"
   fi
-else
-  if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    export CUDA_VISIBLE_DEVICES="1,2,3"
-  fi
 fi
 
 cd "${SCRIPT_DIR}"
@@ -196,6 +187,10 @@ unset PYTHONPATH
 
 # Prefer RAM-backed temp for pip (avoids full /home during large CUDA wheel installs).
 export TMPDIR="${TMPDIR:-/dev/shm}"
+
+# =============================================================================
+# 4. EXECUTION LOGIC
+# =============================================================================
 
 # ─── Install / verify deps ────────────────────────────────────────────────────
 if [[ "${SKIP_PIP}" -eq 1 ]]; then
