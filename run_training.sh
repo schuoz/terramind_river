@@ -8,71 +8,56 @@
 set -euo pipefail
 
 # =============================================================================
-# 1. CONFIGURATION BLOCK
+# 1. EXPERIMENT CONFIGURATION
 # =============================================================================
 
-# ─── Model Selection ─────────────────────────────────────────────────────────
+# --- Model Selection ---
+USE_PRITHVI="--use_prithvi"
+PRITHVI_MODEL="terramind_v1_large"
+PRITHVI_BANDS="0 1 2 3 4 5 6 7 8 9 10 11" # Using all 12 multispectral bands
+BACKBONE="resnet18"                       # (Ignored when USE_PRITHVI is set)
 
-# =========================================================
-# QUICK CONFIG EXAMPLES (Uncomment one block to use)
-# =========================================================
-
-# --- Example 1: Standard ResNet18 (Standard CV) ---
-BACKBONE="resnet18"
-USE_PRITHVI=""
-
-# --- Example 2: TerraMind Base (Foundation Model) ---
-# USE_PRITHVI="--use_prithvi"
-# PRITHVI_MODEL="terramind_v1_base"
-# PRITHVI_BANDS="0 1 2 3 4 5"    # Example for 6-band multispectral input
-# FINETUNE_MODE="freeze_partial" # Options: full, freeze_backbone, freeze_partial
-# LLRD_GAMMA="0.9"               # Layer-wise LR decay (< 1.0 enables decay)
-# UNFREEZE_EPOCH=5               # Unfreeze backbone at epoch 5
-
-# --- Example 3: IBM Prithvi (RGB Data) ---
-# USE_PRITHVI="--use_prithvi"
-# PRITHVI_MODEL="ibm-nasa-geospatial/Prithvi-EO-1.0-100M"
-# PRITHVI_BANDS="0 1 2"        # Script repeats RGB to fit 6-band input
-
-
-# ─── Frequently Changed Training Parameters ──────────────────────────────────
-EPOCHS=50
+# --- Training Parameters ---
+EPOCHS=1000
 LR=1e-4
 BATCH_SIZE=16
 LOSS="gnll"
 LR_SCHEDULER="none"
+SKIP_PIP=1                        # Skip pip installs for faster launch
 
-# GPU Assignment
-# 0 = user did not pass --cuda_devices; 1 = user passed
+# --- HDF5 Data Paths ---
+HDF5="/mnt/samba_eledata/terra_wild/hdf5/train_all_augment.h5"
+VAL_HDF5="/mnt/samba_eledata/terra_wild/hdf5/val_all_augment.h5"
+
+# --- TerraMind Finetuning Settings ---
+FINETUNE_MODE="full"              # choices: encoder_decoder, decoder_only, full, frozen
+STAGED_UNFREEZE=0                 # If > 0, unfreeze backbone at this epoch
+LLRD_GAMMA="1.0"                  # Layer-wise LR decay gamma (< 1.0 enables decay)
+FREEZE_PARTIAL_DEPTH=8
+
+# --- Experiment Management ---
+DATA_ROOT="${DATA_ROOT:-/mnt/samba_eledata/terra_wild}"
+LOG_DIR="${DATA_ROOT}/runs/terramind_v1_large_aug_1000e"
+CKPT_DIR="${DATA_ROOT}/checkpoints/terramind_v1_large_aug_1000e"
+
+# --- GPU Assignment ---
 CUDA_DEVICES_CLI_SET=0
 CUDA_DEVICES_CLI_VALUE=""
-# Default GPU assignment if not overridden (uses GPUs 1, 2, 3)
-export CUDA_VISIBLE_DEVICES="1,2,3"
+export CUDA_VISIBLE_DEVICES="1,2,3" # Default GPUs if not overridden
 
-# Foundation Model Defaults (Only used if USE_PRITHVI="--use_prithvi")
-PRITHVI_MODEL="${PRITHVI_MODEL:-ibm-nasa-geospatial/Prithvi-EO-1.0-100M}"
-PRITHVI_BANDS="${PRITHVI_BANDS:-0 1 2}"
-FINETUNE_MODE="${FINETUNE_MODE:-full}"
-FREEZE_PARTIAL_DEPTH=8
-UNFREEZE_EPOCH="${UNFREEZE_EPOCH:-0}"
-LLRD_GAMMA="${LLRD_GAMMA:-1.0}"
-
-# Execution / Debug Flags
+# --- Execution / Debug Flags ---
 DRY_RUN=""                        # Set to "--dry_run" to enable
 NO_TENSORBOARD=0                  # Set to 1 to skip tensorboard
-SKIP_PIP=0                        # Set to 1 to skip pip install step
 
-# ─── Fixed / Infrastructure Parameters ───────────────────────────────────────
-DATA_ROOT="${DATA_ROOT:-/mnt/samba_eledata/terra_wild}"
+
+# =============================================================================
+# 2. INFRASTRUCTURE & DEFAULTS
+# =============================================================================
+
 ANNOTATION="data/Annotation.csv"
 DEFAULT_TRAIN_TIF_ROOT="/home/szong/df/work/s2_50000/data/resample_real_time_sr_nocloud_train_v2"
 DEFAULT_VAL_TIF_ROOT="/home/szong/df/work/s2_50000/data/resample_real_time_sr_nocloud_val_v2"
 declare -a IMG_DIR_LIST=()
-
-HDF5=""
-VAL_HDF5=""
-LOG_DIR=""
-CKPT_DIR=""
 
 IMG_SIZE=224
 VAL_SPLIT=0.15
@@ -95,11 +80,11 @@ USE_STD_AS_INPUT=""               # Set to "--use_std_as_input" to enable
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-${SCRIPT_DIR}/wildterrain_env}"
 
+
 # =============================================================================
-# 2. VIRTUAL ENVIRONMENT SETUP
+# 3. VIRTUAL ENVIRONMENT SETUP
 # =============================================================================
 
-# Detect OS for venv activation path
 if [[ "$OSTYPE" == "msys"* || "$OSTYPE" == "cygwin"* ]] || \
    [[ -d "${VENV_DIR}/Scripts" ]]; then
   PYTHON="${VENV_DIR}/Scripts/python"
@@ -109,8 +94,9 @@ else
   ACTIVATE="${VENV_DIR}/bin/activate"
 fi
 
+
 # =============================================================================
-# 3. ARGUMENT PARSING (Overrides Configuration Block)
+# 4. ARGUMENT PARSING (Overrides Configuration Block)
 # =============================================================================
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -179,10 +165,6 @@ if [[ ${#IMG_DIR_LIST[@]} -eq 0 ]]; then
   IMG_DIR_LIST=("${DEFAULT_TRAIN_TIF_ROOT}" "${DEFAULT_VAL_TIF_ROOT}")
 fi
 
-[[ -z "${HDF5}" ]] && HDF5="${DATA_ROOT}/dataset.h5"
-[[ -z "${LOG_DIR}" ]] && LOG_DIR="${DATA_ROOT}/runs/wildterrain"
-[[ -z "${CKPT_DIR}" ]] && CKPT_DIR="${DATA_ROOT}/checkpoints"
-
 if [[ "${ANNOTATION}" == /* ]]; then
   ANNOTATION_ABS="${ANNOTATION}"
 else
@@ -199,7 +181,6 @@ cd "${SCRIPT_DIR}"
 
 if [[ ! -f "${ACTIVATE}" ]]; then
   echo "ERROR: Virtualenv not found at ${VENV_DIR} (missing ${ACTIVATE})."
-  echo "Create it where you have several GB free (CUDA wheels are large)."
   exit 1
 fi
 
@@ -208,11 +189,12 @@ source "${ACTIVATE}"
 unset PYTHONPATH
 export TMPDIR="${TMPDIR:-/dev/shm}"
 
+
 # =============================================================================
-# 4. EXECUTION LOGIC
+# 5. EXECUTION LOGIC
 # =============================================================================
 
-# ─── Install / verify deps ────────────────────────────────────────────────────
+# --- Install / verify deps ---
 if [[ "${SKIP_PIP}" -eq 1 ]]; then
   echo "==> Skipping pip installs (--skip_pip)."
 else
@@ -227,7 +209,7 @@ mkdir -p "${DATA_ROOT}" "${LOG_DIR}" "${CKPT_DIR}"
 HDF5_DIR="$(dirname "${HDF5}")"
 mkdir -p "${HDF5_DIR}"
 
-# ─── Step 1: Build HDF5 ───────────────────────────────────────────────────────
+# --- Step 1: Build HDF5 ---
 if [[ -f "${HDF5}" ]]; then
   echo "==> '${HDF5}' already exists – skipping preprocessing."
 else
@@ -239,7 +221,7 @@ else
     --img_dirs   "${IMG_DIR_LIST[@]}"
 fi
 
-# ─── Step 2: Train ───────────────────────────────────────────────────────────
+# --- Step 2: Train ---
 echo ""
 echo "╔══════════════════════════════════════════╗"
 echo "║         Starting Training                ║"
@@ -249,7 +231,7 @@ echo "║  hdf5        : ${HDF5}"
 if [[ -n "${USE_PRITHVI}" ]]; then
   echo "║  backbone    : Foundation Model (${PRITHVI_MODEL})"
   echo "║  bands       : ${PRITHVI_BANDS}"
-  echo "║  finetune    : ${FINETUNE_MODE} (LR decay: ${LLRD_GAMMA})"
+  echo "║  finetune    : ${FINETUNE_MODE}"
 else
   echo "║  backbone    : ${BACKBONE} (Standard)"
 fi
@@ -294,7 +276,7 @@ echo ""
   --metric_for_best "${METRIC_FOR_BEST}" \
   ${DRY_RUN}
 
-# ─── Step 3: TensorBoard ─────────────────────────────────────────────────────
+# --- Step 3: TensorBoard ---
 if [[ "${NO_TENSORBOARD}" -eq 1 ]]; then
   echo "==> Training complete."
 else
